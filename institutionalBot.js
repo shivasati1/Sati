@@ -1,128 +1,191 @@
-const axios = require("axios");
-const { MongoClient } = require("mongodb");
-require("dotenv").config();
+require('dotenv').config();
+const axios = require('axios');
+const { MongoClient } = require('mongodb');
 
-const headers = { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64)' };
+const MONGO_URI = process.env.MONGO_URI;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 
-const client = new MongoClient(process.env.MONGO_URI);
-let db;
+let mongoClient, db, signalsCollection;
 
-function sleep(ms) {
-  return new Promise(res => setTimeout(res, ms + Math.random() * 300));
-}
-
-async function fetchSymbols() {
-  const url = "https://fapi.binance.com/fapi/v1/exchangeInfo";
-  const res = await axios.get(url, { headers });
-  return res.data.symbols
-    .filter(s => s.contractType === "PERPETUAL" && s.quoteAsset === "USDT")
-    .map(s => s.symbol);
-}
-
-async function fetchLightMetrics(symbol) {
+async function initMongo() {
   try {
-    const url = `https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=${symbol}`;
-    const res = await axios.get(url, { headers });
-    const data = res.data;
-
-    return {
-      symbol,
-      fundingRate: parseFloat(data.lastFundingRate || 0).toFixed(6),
-      volume: parseFloat(data.volume).toFixed(2),
-      priceChangePercent: data.priceChangePercent + "%",
-    };
+    if (!MONGO_URI) throw new Error("Missing MONGO_URI");
+    mongoClient = new MongoClient(MONGO_URI);
+    await mongoClient.connect();
+    db = mongoClient.db("tradingBot");
+    signalsCollection = db.collection("insights");
+    console.log("MongoDB connected.");
   } catch (err) {
-    console.error(`Light fetch failed for ${symbol}`);
-    return null;
+    console.warn("MongoDB not connected:", err.message);
+    signalsCollection = null;
   }
 }
 
-async function analyzeWithAI(symbolData) {
-  const prompt = `Symbol: ${symbolData.symbol}
-Funding Rate: ${symbolData.fundingRate}
-Volume: ${symbolData.volume}
-24h Change: ${symbolData.priceChangePercent}
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-Give a brief institutional insight:
-- Confidence (0-100%)
-- Risk (low/medium/high)
-- Suggested action (long/short/avoid)`;
+async function fetchSymbols() {
+  const url = 'https://fapi.binance.com/fapi/v1/exchangeInfo';
+  const res = await axios.get(url);
+  return res.data.symbols
+    .filter(s => s.contractType === 'PERPETUAL' && s.quoteAsset === 'USDT')
+    .map(s => s.symbol);
+}
 
-  const res = await axios.post(
-    "https://openrouter.ai/api/v1/chat/completions",
-    {
-      model: "meta-llama/llama-4-maverick:free",
-      messages: [{ role: "user", content: prompt }],
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        "Content-Type": "application/json",
-      },
+async function fetchFundingRate(symbol) {
+  const res = await axios.get(`https://fapi.binance.com/fapi/v1/fundingRate?symbol=${symbol}&limit=1`);
+  return res.data[0]?.fundingRate ?? "N/A";
+}
+
+async function fetchOpenInterest(symbol) {
+  const res = await axios.get(`https://fapi.binance.com/fapi/v1/openInterest?symbol=${symbol}`);
+  return res.data?.openInterest ?? "N/A";
+}
+
+async function fetchLongShortRatio(symbol) {
+  const res = await axios.get(`https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${symbol}&period=1h&limit=1`);
+  return res.data[0]?.longShortRatio ?? "N/A";
+}
+
+async function fetchTakerBuySellRatio(symbol) {
+  const res = await axios.get(`https://fapi.binance.com/futures/data/takerlongshortRatio?symbol=${symbol}&period=1h&limit=1`);
+  return res.data[0]?.buySellRatio ?? "N/A";
+}
+
+async function fetchOrderBookImbalance(symbol) {
+  const res = await axios.get(`https://fapi.binance.com/fapi/v1/depth?symbol=${symbol}&limit=50`);
+  const bidVolume = res.data.bids.reduce((sum, [_, qty]) => sum + parseFloat(qty), 0);
+  const askVolume = res.data.asks.reduce((sum, [_, qty]) => sum + parseFloat(qty), 0);
+  const imbalance = bidVolume - askVolume;
+  return imbalance > 0 ? "Strong buy wall detected"
+       : imbalance < 0 ? "Strong sell wall detected"
+       : "Balanced order book";
+}
+
+async function fetchCVD(symbol) {
+  const res = await axios.get(`https://fapi.binance.com/fapi/v1/trades?symbol=${symbol}&limit=500`);
+  let cvd = 0;
+  for (const trade of res.data) {
+    const qty = parseFloat(trade.qty);
+    cvd += trade.isBuyerMaker ? -qty : qty;
+  }
+  return cvd > 0 ? "Showing hidden buying"
+       : cvd < 0 ? "Showing hidden selling"
+       : "Neutral CVD";
+}
+
+async function getInsight(prompt) {
+  const res = await axios.post("https://openrouter.ai/api/v1/chat/completions", {
+    model: "meta-llama/llama-4-maverick:free",
+    messages: [{ role: "user", content: prompt }]
+  }, {
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json"
     }
-  );
-
+  });
   return res.data.choices[0].message.content;
 }
 
-function extractConfidenceScore(text) {
-  const match = text.match(/(\d{1,3})\s*%/);
-  return match ? parseInt(match[1]) : 0;
+function extractConfidenceScore(insight) {
+  const match = insight.match(/(\d{1,3})\s*%/);
+  const score = match ? parseInt(match[1]) : 0;
+  return isNaN(score) ? 0 : score;
 }
 
-async function sendTelegram(msg) {
-  const url = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+async function sendTelegram(message) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   await axios.post(url, {
-    chat_id: process.env.TELEGRAM_CHAT_ID,
-    text: msg,
+    chat_id: TELEGRAM_CHAT_ID,
+    text: message,
     parse_mode: "Markdown"
   });
 }
 
-async function alreadyAnalyzed(symbol, date) {
-  return await db.collection("signals").findOne({ symbol, date });
+async function alreadyAlertedToday(symbol) {
+  if (!signalsCollection) return false;
+  const today = new Date();
+  today.setUTCHours(0, 0, 0, 0);
+  const existing = await signalsCollection.findOne({ symbol, date: { $gte: today } });
+  return !!existing;
 }
 
-async function storeSignal(symbol, date, insight, score) {
-  await db.collection("signals").insertOne({ symbol, date, insight, score });
+async function saveSignal(symbol, insight, score) {
+  if (!signalsCollection) return;
+  await signalsCollection.insertOne({
+    symbol,
+    insight,
+    score,
+    date: new Date()
+  });
 }
 
 (async () => {
+  await initMongo();
+
+  console.log("Fetching symbols...");
+  let symbols = [];
   try {
-    await client.connect();
-    db = client.db("institutionalBot");
+    symbols = await fetchSymbols();
+  } catch (e) {
+    console.error("Failed to fetch symbols:", e.message);
+    process.exit(1);
+  }
 
-    const date = new Date().toISOString().split("T")[0];
-    const symbols = await fetchSymbols();
-    const startIndex = Math.floor(Math.random() * (symbols.length - 10));
-    const batch = symbols.slice(startIndex, startIndex + 10);
+  // Round-robin shuffle to avoid detection
+  for (const symbol of symbols.sort(() => 0.5 - Math.random()).slice(0, 15)) {
+    try {
+      console.log(`\nAnalyzing ${symbol}...`);
 
-    for (const symbol of batch) {
-      if (await alreadyAnalyzed(symbol, date)) {
-        console.log(`Skipped ${symbol} (already analyzed)`);
+      if (await alreadyAlertedToday(symbol)) {
+        console.log(`Already alerted for ${symbol}, skipping.`);
         continue;
       }
 
-      const data = await fetchLightMetrics(symbol);
-      if (!data) continue;
+      const fundingRate = await fetchFundingRate(symbol);
+      const openInterest = await fetchOpenInterest(symbol);
+      const longShortRatio = await fetchLongShortRatio(symbol);
+      const takerBuySellRatio = await fetchTakerBuySellRatio(symbol);
+      const orderBookImbalance = await fetchOrderBookImbalance(symbol);
+      const cvd = await fetchCVD(symbol);
 
-      const insight = await analyzeWithAI(data);
+      const prompt = `
+Symbol: ${symbol}
+Funding Rate: ${fundingRate}
+Open Interest: ${openInterest}
+Long/Short Ratio: ${longShortRatio}
+Taker Buy/Sell Ratio: ${takerBuySellRatio}
+Order Book: ${orderBookImbalance}
+CVD: ${cvd}
+
+Based on the above, provide institutional-level analysis with:
+- Confidence (0–100%)
+- Risk Level (low/medium/high)
+- Recommended Action (long/short/avoid)
+`;
+
+      const insight = await getInsight(prompt);
       const score = extractConfidenceScore(insight);
 
-      console.log(`\n${symbol} Insight [${score}%]:\n${insight}`);
+      console.log(`Insight for ${symbol} [${score}%]: ${insight}`);
 
       if (score >= 85) {
-        await sendTelegram(`🚨 *${symbol} Institutional Signal* 🚨\n${insight}`);
+        await sendTelegram(`🚨 *${symbol} Insight* 🚨\n${insight}`);
+        await saveSignal(symbol, insight, score);
+        console.log(`Telegram alert sent for ${symbol}`);
+      } else {
+        console.log(`Skipped ${symbol} (Confidence: ${score}%)`);
       }
 
-      await storeSignal(symbol, date, insight, score);
-      await sleep(3000); // Human-like delay
+      await sleep(3000); // delay to reduce detection
+    } catch (err) {
+      console.error(`Error with ${symbol}:`, err.message);
     }
-
-    await client.close();
-    console.log("Bot run completed safely.");
-  } catch (err) {
-    console.error("Critical error:", err.message);
-    process.exit(1);
   }
+
+  if (mongoClient) await mongoClient.close();
+  console.log("\nFinished all symbols.");
 })();
