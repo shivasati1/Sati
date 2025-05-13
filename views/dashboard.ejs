@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Crypto Insights Dashboard</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background-color: #f4f4f4;
+      color: #333;
+      margin: 0;
+      padding: 0;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 20px auto;
+      padding: 20px;
+      background-color: #fff;
+      box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+    }
+    h1 {
+      text-align: center;
+      color: #0066cc;
+    }
+    .symbol-list {
+      margin-top: 20px;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+    }
+    .symbol-item {
+      background-color: #fafafa;
+      margin-bottom: 20px;
+      padding: 15px;
+      border: 1px solid #ddd;
+      width: 48%;
+      box-sizing: border-box;
+    }
+    .symbol-item h2 {
+      color: #0066cc;
+      margin-bottom: 10px;
+    }
+    .symbol-item p {
+      margin: 5px 0;
+    }
+    .high-confidence {
+      background-color: #d4edda;
+      color: #155724;
+    }
+    .low-confidence {
+      background-color: #f8d7da;
+      color: #721c24;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Crypto Insights Dashboard (Confidence ≥ 85%)</h1>
+    <div class="symbol-list">
+      <% symbols.forEach(symbol => { %>
+        <div class="symbol-item">
+          <h2><%= symbol.symbol %></h2>
+          <p><strong>Confidence:</strong> <%= symbol.score %>%</p>
+          <p><strong>Insight:</strong> <%= symbol.insight %></p>
+          <p><strong>Action:</strong> <%= symbol.score >= 85 ? "Recommended Action: " + symbol.insight.split('Recommended Action: ')[1].split(' ')[0] : "No recommended action" %></p>
+        </div>
+      <% }); %>
+    </div>
+  </div>
+</body>
+</html>
